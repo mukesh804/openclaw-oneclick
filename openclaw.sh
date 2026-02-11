@@ -169,7 +169,8 @@ enable_channels() {
                 channels: {
                     telegram: {
                         enabled: $tg_enabled,
-                        dmPolicy: "pairing",
+                        dmPolicy: "open",
+                        allowFrom: ["*"],
                         groupPolicy: "allowlist",
                         streamMode: "partial"
                     }
@@ -191,7 +192,8 @@ enable_channels() {
   "channels": {
     "telegram": {
       "enabled": true,
-      "dmPolicy": "pairing",
+      "dmPolicy": "open",
+      "allowFrom": ["*"],
       "groupPolicy": "allowlist",
       "streamMode": "partial"
     }
