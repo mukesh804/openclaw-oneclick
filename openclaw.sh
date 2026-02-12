@@ -102,6 +102,48 @@ clean_stale_pid() {
     fi
 }
 
+# Find orphan "openclaw gateway run" processes not managed by our wrapper
+find_orphan_gateways() {
+    local managed_wrapper_pid=""
+    if [ -f "$PID_FILE" ]; then
+        managed_wrapper_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    fi
+
+    local gw_pids
+    gw_pids=$(pgrep -f "openclaw gateway run" 2>/dev/null || true)
+    [ -z "$gw_pids" ] && return
+
+    for gw_pid in $gw_pids; do
+        # Skip if it's a child of our managed wrapper
+        if [ -n "$managed_wrapper_pid" ] && kill -0 "$managed_wrapper_pid" 2>/dev/null; then
+            local parent
+            parent=$(ps -o ppid= -p "$gw_pid" 2>/dev/null | tr -d ' ')
+            [ "$parent" = "$managed_wrapper_pid" ] && continue
+        fi
+        echo "$gw_pid"
+    done
+}
+
+# Kill orphan gateway processes and warn
+kill_orphan_gateways() {
+    local orphans
+    orphans=$(find_orphan_gateways)
+    [ -z "$orphans" ] && return 0
+
+    for opid in $orphans; do
+        log_warn "Found orphan gateway process (PID: $opid) — killing it"
+        kill "$opid" 2>/dev/null || true
+    done
+    sleep 1
+    # Force kill any survivors
+    for opid in $orphans; do
+        if kill -0 "$opid" 2>/dev/null; then
+            kill -9 "$opid" 2>/dev/null || true
+        fi
+    done
+    return 0
+}
+
 # ==============================================================
 # Setup: Validate required env vars
 # ==============================================================
@@ -283,6 +325,9 @@ start_gateway() {
         return 0
     fi
 
+    # Kill any orphan gateway processes (e.g. user ran "openclaw gateway run" directly)
+    kill_orphan_gateways
+
     rotate_log
     echo -e "${GREEN}Starting OpenClaw Gateway...${NC}"
 
@@ -361,7 +406,16 @@ stop_gateway() {
     acquire_lock
 
     if ! is_running; then
-        echo -e "${YELLOW}Gateway is not running.${NC}"
+        # Even if our managed wrapper isn't running, kill orphan processes
+        local orphans
+        orphans=$(find_orphan_gateways)
+        if [ -n "$orphans" ]; then
+            log_warn "No managed gateway, but found orphan process(es) — cleaning up"
+            kill_orphan_gateways
+            echo -e "${GREEN}Stopped orphan gateway process(es).${NC}"
+        else
+            echo -e "${YELLOW}Gateway is not running.${NC}"
+        fi
         return 0
     fi
 
@@ -387,6 +441,10 @@ stop_gateway() {
     fi
 
     rm -f "$PID_FILE"
+
+    # Also kill any orphan gateway processes
+    kill_orphan_gateways
+
     echo -e "${GREEN}Stopped.${NC}"
 }
 
@@ -402,6 +460,15 @@ status_gateway() {
     else
         echo -e "${RED}Gateway auto-runner is not running.${NC}"
     fi
+
+    # Warn about orphan processes
+    local orphans
+    orphans=$(find_orphan_gateways)
+    if [ -n "$orphans" ]; then
+        echo -e "${YELLOW}⚠ WARNING: Found unmanaged gateway process(es): ${orphans}${NC}"
+        echo -e "${YELLOW}  These were likely started with 'openclaw gateway run' directly.${NC}"
+        echo -e "${YELLOW}  Run '$0 stop' to clean them up, or '$0 restart' to take over.${NC}"
+    fi
 }
 
 # ==============================================================
@@ -413,6 +480,38 @@ show_logs() {
     else
         echo "No log file found at $LOG_FILE"
     fi
+}
+
+# ==============================================================
+# Setup: Install gateway guard (prevent direct "openclaw gateway run")
+# ==============================================================
+install_gateway_guard() {
+    local guard_file="/etc/profile.d/openclaw-guard.sh"
+    local setup_dir="$SCRIPT_DIR"
+
+    log "Installing gateway guard..."
+    sudo tee "$guard_file" > /dev/null <<GUARDEOF
+# Intercept "openclaw gateway run" to prevent unmanaged gateway processes.
+# All gateway lifecycle should go through openclaw.sh (start/stop/restart).
+openclaw() {
+    if [ "\$1" = "gateway" ] && [ "\${2:-}" = "run" ]; then
+        echo "⚠  Do not run 'openclaw gateway run' directly."
+        echo "   Use the managed gateway instead:"
+        echo ""
+        echo "     ${setup_dir}/openclaw.sh start    # start gateway"
+        echo "     ${setup_dir}/openclaw.sh stop     # stop gateway"
+        echo "     ${setup_dir}/openclaw.sh restart  # restart gateway"
+        echo "     ${setup_dir}/openclaw.sh status   # check status"
+        echo "     ${setup_dir}/openclaw.sh logs     # tail logs"
+        echo ""
+        echo "   This ensures PID tracking, auto-restart, and log rotation."
+        return 1
+    fi
+    command openclaw "\$@"
+}
+GUARDEOF
+    sudo chmod +x "$guard_file"
+    log_success "Gateway guard installed (${guard_file})"
 }
 
 # ==============================================================
@@ -432,6 +531,7 @@ run_setup() {
         log_warn "openclaw doctor not available or config needs manual review"
     fi
     ensure_gateway_mode
+    install_gateway_guard
     start_gateway
 }
 
